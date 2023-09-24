@@ -14,4 +14,4 @@ docs/
 .env
 
 # Tests
-lconv.info
+lcov.info
