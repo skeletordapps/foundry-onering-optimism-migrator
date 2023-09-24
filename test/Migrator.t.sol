@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.21;
 
-import {Test, console2} from "forge-std/Test.sol";
+import {console2, Test} from "forge-std/Test.sol";
 import {DeployMigratorScript} from "../script/DeployMigrator.sol";
 import {Migrator} from "../src/Migrator.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -23,8 +23,8 @@ contract MigratorTest is Test {
 
     uint256 oneEther = 1 ether;
 
-    event migrated(uint256 amount);
-    event feededRingV2(uint256 amount);
+    event migrated(address indexed account, uint256 amount);
+    event feededRingV2(address indexed account, uint256 amount);
     event withdrawal(uint256 amount);
 
     function setUp() public {
@@ -52,6 +52,10 @@ contract MigratorTest is Test {
         assert(migrator.paused() == true);
     }
 
+    //////////////////////////////////////
+    // PAUSABLE TESTS
+    //////////////////////////////////////
+
     modifier unpaused() {
         vm.startPrank(migrator.owner());
         migrator.unpause();
@@ -59,7 +63,7 @@ contract MigratorTest is Test {
         _;
     }
 
-    function test__OnlyOnwerCanUnpause() public {
+    function test_OnlyOnwerCanUnpause() public {
         vm.expectRevert("Ownable: caller is not the owner");
         migrator.unpause();
 
@@ -70,7 +74,7 @@ contract MigratorTest is Test {
         assertEq(migrator.paused(), false);
     }
 
-    function test__OnlyOnwerCanPause() public unpaused {
+    function test_OnlyOnwerCanPause() public unpaused {
         vm.expectRevert("Ownable: caller is not the owner");
         migrator.pause();
 
@@ -81,49 +85,57 @@ contract MigratorTest is Test {
         assertEq(migrator.paused(), true);
     }
 
-    function test__CannotFeedRingV2WithZeroAsAmount() public unpaused {
+    //////////////////////////////////////
+    // FEED RING V2 TESTS
+    //////////////////////////////////////
+
+    function test_CannotFeedRingV2WithZeroAsAmount() public unpaused {
         vm.expectRevert(Migrator.Migrator__Amount_Cannot_Be_Zero.selector);
         migrator.feedRingV2(0);
     }
 
-    function test__CannotFeedRingV2WithoutBalance() public unpaused {
+    function test_CannotFeedRingV2WithoutBalance() public unpaused {
         vm.expectRevert(Migrator.Migrator__Insufficient_Balance.selector);
         migrator.feedRingV2(oneEther);
     }
 
-    modifier dealFundsToActor(address actor, address token) {
+    modifier dealFundsToActor(address actor, address token, uint256 amount) {
         vm.startPrank(actor);
-        ERC20(token).approve(address(migrator), oneEther);
-        deal(token, actor, oneEther);
+        ERC20(token).approve(address(migrator), amount);
+        deal(token, actor, amount);
         vm.stopPrank();
         _;
     }
 
-    function test__CanFeedRingV2() public unpaused dealFundsToActor(john, ringV2) {
+    function test_CanFeedRingV2() public unpaused dealFundsToActor(john, ringV2, oneEther) {
         vm.startPrank(john);
         vm.expectEmit();
-        emit feededRingV2(oneEther);
+        emit feededRingV2(john, oneEther);
         migrator.feedRingV2(oneEther);
         vm.stopPrank();
 
         assertEq(ERC20(ringV2).balanceOf(address(migrator)), oneEther);
     }
 
-    function test__RevertWithdrawWhenIsNotOwner() public {
+    //////////////////////////////////////
+    // WITHDRAW RING V1 TESTS
+    //////////////////////////////////////
+
+    function test_RevertWithdrawWhenIsNotOwner() public {
         vm.startPrank(john);
         vm.expectRevert("Ownable: caller is not the owner");
         migrator.withdraw();
         vm.stopPrank();
     }
 
-    function test__RevertWithdrawWhenHasNoBalance() public {
+    function test_RevertWithdrawWhenHasNoBalance() public {
         vm.startPrank(migrator.owner());
         vm.expectRevert(Migrator.Migrator__Insufficient_Balance.selector);
         migrator.withdraw();
         vm.stopPrank();
     }
 
-    function test__WithdrawRing() public {
+    function test_WithdrawRing() public {
         deal(ring, address(migrator), oneEther);
         assertEq(ERC20(ring).balanceOf(address(migrator)), oneEther);
 
@@ -141,22 +153,60 @@ contract MigratorTest is Test {
         assertEq(receiverBalanceAfter - receiverBalanceBefore, oneEther);
     }
 
-    function test__RevertsMigrationWhenPaused() public {
+    //////////////////////////////////////
+    // MIGRATION TESTS
+    //////////////////////////////////////
+
+    function test_RevertsMigrationWhenPaused() public {
         vm.expectRevert("Pausable: paused");
         migrator.migrate(oneEther);
     }
 
-    function test__RevertsMigrationWithZeroAmount() public unpaused {
+    function test_RevertsMigrationWithZeroAmount() public unpaused {
         vm.expectRevert(Migrator.Migrator__Amount_Cannot_Be_Zero.selector);
         migrator.migrate(0);
     }
 
-    function test__RevertsMigrationWhenBalanceIsLowerThanAmount() public unpaused {
+    function test_RevertsMigrationWhenBalanceIsLowerThanAmount() public unpaused {
         vm.expectRevert(Migrator.Migrator__Insufficient_Balance.selector);
         migrator.migrate(oneEther);
     }
 
-    function test__MigratesRingToRingV2() public unpaused dealFundsToActor(john, ring) {
+    function test_RevertsWhenContractHasNoBalanceToMigrate() public unpaused dealFundsToActor(bob, ring, oneEther) {
+        vm.startPrank(bob);
+        vm.expectRevert(Migrator.Migrator__Insufficient_Balance.selector);
+        migrator.migrate(oneEther);
+        vm.stopPrank();
+    }
+
+    function test_RevertsMigrationWhenExceedsLimit() public unpaused {
+        uint256 amount = migrator.MAX_RING_PER_MIGRATION() + oneEther;
+        vm.expectRevert(Migrator.Migrator__Exceeds_Max_Migration_Limit.selector);
+        migrator.migrate(amount);
+    }
+
+    modifier migrateLimit(address actor) {
+        deal(ringV2, address(migrator), migrator.MAX_RING_PER_MIGRATION());
+        uint256 amount = migrator.MAX_RING_PER_MIGRATION();
+        vm.startPrank(actor);
+        migrator.migrate(amount);
+        vm.stopPrank();
+        _;
+    }
+
+    function test_RevertsWhenAlreadyMigratedMaxLimit()
+        public
+        unpaused
+        dealFundsToActor(bob, ring, migrator.MAX_RING_PER_MIGRATION() * 2)
+        migrateLimit(bob)
+    {
+        vm.startPrank(bob);
+        vm.expectRevert(Migrator.Migrator__Not_Allowed_For_One_Day.selector);
+        migrator.migrate(oneEther);
+        vm.stopPrank();
+    }
+
+    function test_MigratesRingToRingV2() public unpaused dealFundsToActor(john, ring, oneEther) {
         deal(ringV2, address(migrator), oneEther);
 
         uint256 balanceOfRingBefore = ERC20(ring).balanceOf(john);
@@ -164,7 +214,7 @@ contract MigratorTest is Test {
 
         vm.startPrank(john);
         vm.expectEmit();
-        emit migrated(oneEther);
+        emit migrated(john, oneEther);
         migrator.migrate(oneEther);
         vm.stopPrank();
 
@@ -178,34 +228,55 @@ contract MigratorTest is Test {
         assertEq(balanceOfRingV2After, oneEther);
     }
 
-    function test__RevertsMigratingAllWhenPaused() public {
+    function test_CanMigrateAgainWhenReachLimitAndWaitOneDay()
+        public
+        unpaused
+        dealFundsToActor(bob, ring, migrator.MAX_RING_PER_MIGRATION() * 2)
+        migrateLimit(bob)
+    {
+        deal(ringV2, address(migrator), oneEther);
+        vm.warp(block.timestamp + 1 days);
+        vm.startPrank(bob);
+        vm.expectEmit();
+        emit migrated(bob, oneEther);
+        migrator.migrate(oneEther);
+        vm.stopPrank();
+    }
+
+    //////////////////////////////////////
+    // MIGRATING ALL TESTS
+    //////////////////////////////////////
+
+    function test_RevertsMigratingAllWhenPaused() public {
         vm.expectRevert("Pausable: paused");
         migrator.migrateAll();
     }
 
-    function test__RevertsMigratingllWhenHasNoBalance() public unpaused {
+    function test_RevertsMigratingllWhenHasNoBalance() public unpaused {
         vm.expectRevert(Migrator.Migrator__Insufficient_Balance.selector);
         migrator.migrateAll();
     }
 
-    function test__RevertsMigratingAllWhenUserBalanceIsHigherThanContractBalance()
+    function test_RevertsMigratingAllWhenUserBalanceIsHigherThanContractBalance()
         public
         unpaused
-        dealFundsToActor(john, ring)
+        dealFundsToActor(john, ring, oneEther)
     {
         deal(ringV2, address(migrator), oneEther / 2);
+        vm.startPrank(john);
         vm.expectRevert(Migrator.Migrator__Insufficient_Balance.selector);
         migrator.migrateAll();
+        vm.stopPrank();
     }
 
-    function test__MigratesAllRingFundsToRingV2() public unpaused dealFundsToActor(john, ring) {
+    function test_MigratesAllRingFundsToRingV2() public unpaused dealFundsToActor(john, ring, oneEther) {
         deal(ringV2, address(migrator), oneEther);
 
         uint256 balanceOfRingBefore = ERC20(ring).balanceOf(john);
         uint256 balanceOfRingV2Before = ERC20(ringV2).balanceOf(john);
 
         vm.startPrank(john);
-        emit migrated(oneEther);
+        emit migrated(john, oneEther);
         migrator.migrateAll();
         vm.stopPrank();
 

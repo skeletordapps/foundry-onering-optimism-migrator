@@ -7,7 +7,6 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/security/Pausable.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {console2} from "forge-std/Script.sol";
 
 /**
  * ██████╗ ██╗███╗   ██╗ ██████╗     ███╗   ███╗██╗ ██████╗ ██████╗  █████╗ ████████╗ ██████╗ ██████╗
@@ -26,22 +25,34 @@ import {console2} from "forge-std/Script.sol";
  *
  * @title Ring Migrator Contract
  * @author 0xTheL
- * @notice This contract allows users to migrate they're old Ring to the new Ring v2.
+ * @notice This contract allows users to migrate Ring v1 to the new Ring v2.
  */
 
 contract Migrator is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    uint256 public constant MAX_RING_PER_MIGRATION = 1000000 ether;
+
     address public immutable ring;
     address public immutable ringV2;
     address public immutable receiver;
 
+    struct UserMigration {
+        uint256 totalMigrated;
+        uint256 lastMigrationAmount;
+        uint256 lastTimestamp;
+    }
+
+    mapping(address userAddress => UserMigration userMigration) migrations;
+
     error Migrator__Insufficient_Balance();
     error Migrator__Invalid_Token_Address();
     error Migrator__Amount_Cannot_Be_Zero();
+    error Migrator__Exceeds_Max_Migration_Limit();
+    error Migrator__Not_Allowed_For_One_Day();
 
-    event migrated(uint256 amount);
-    event feededRingV2(uint256 amount);
+    event migrated(address indexed account, uint256 amount);
+    event feededRingV2(address indexed account, uint256 amount);
     event withdrawal(uint256 amount);
 
     constructor(address _ring, address _ringV2, address _receiver) {
@@ -52,12 +63,27 @@ contract Migrator is Ownable, Pausable, ReentrancyGuard {
         _pause();
     }
 
-    modifier hasBalance(address token, uint256 amount) {
+    modifier canMigrate() {
+        UserMigration memory userMigration = migrations[msg.sender];
+        if (
+            userMigration.lastMigrationAmount == MAX_RING_PER_MIGRATION
+                && block.timestamp - userMigration.lastTimestamp < 1 days
+        ) revert Migrator__Not_Allowed_For_One_Day();
+        _;
+    }
+
+    modifier senderHasBalance(address token, uint256 amount) {
         if (token != ring && token != ringV2) revert Migrator__Invalid_Token_Address();
         if (amount == 0) revert Migrator__Amount_Cannot_Be_Zero();
+        if (amount > MAX_RING_PER_MIGRATION) revert Migrator__Exceeds_Max_Migration_Limit();
 
         uint256 userBalance = ERC20(token).balanceOf(msg.sender);
         if (userBalance < amount) revert Migrator__Insufficient_Balance();
+        _;
+    }
+
+    modifier contractHasBalance(uint256 amount) {
+        if (ERC20(ringV2).balanceOf(address(this)) < amount) revert Migrator__Insufficient_Balance();
         _;
     }
 
@@ -74,7 +100,7 @@ contract Migrator is Ownable, Pausable, ReentrancyGuard {
      *
      * Emits a {migrated} event.
      */
-    function migrateAll() external whenNotPaused nonReentrant {
+    function migrateAll() external whenNotPaused canMigrate nonReentrant {
         uint256 userBalance = ERC20(ring).balanceOf(msg.sender);
         if (userBalance == 0) revert Migrator__Insufficient_Balance();
 
@@ -92,9 +118,9 @@ contract Migrator is Ownable, Pausable, ReentrancyGuard {
      *
      * Emits a {feededRingV2} event.
      */
-    function feedRingV2(uint256 amount) external hasBalance(ringV2, amount) {
+    function feedRingV2(uint256 amount) external senderHasBalance(ringV2, amount) {
         IERC20(ringV2).safeTransferFrom(msg.sender, address(this), amount);
-        emit feededRingV2(amount);
+        emit feededRingV2(msg.sender, amount);
     }
 
     /**
@@ -149,7 +175,14 @@ contract Migrator is Ownable, Pausable, ReentrancyGuard {
      * Emits a {migrated} event.
      */
 
-    function migrate(uint256 amount) public whenNotPaused hasBalance(ring, amount) nonReentrant {
+    function migrate(uint256 amount)
+        public
+        whenNotPaused
+        canMigrate
+        contractHasBalance(amount)
+        senderHasBalance(ring, amount)
+        nonReentrant
+    {
         _migrate(amount);
     }
 
@@ -166,8 +199,15 @@ contract Migrator is Ownable, Pausable, ReentrancyGuard {
      */
     function _migrate(uint256 amount) internal {
         IERC20(ring).safeTransferFrom(msg.sender, address(this), amount);
-        IERC20(ringV2).safeTransfer(msg.sender, amount);
 
-        emit migrated(amount);
+        UserMigration memory migration = migrations[msg.sender];
+        migration.totalMigrated += amount;
+        migration.lastMigrationAmount = amount;
+        migration.lastTimestamp = block.timestamp;
+        migrations[msg.sender] = migration;
+
+        emit migrated(msg.sender, amount);
+
+        IERC20(ringV2).safeTransfer(msg.sender, amount);
     }
 }
