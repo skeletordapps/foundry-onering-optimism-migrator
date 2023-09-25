@@ -2,8 +2,8 @@
 pragma solidity ^0.8.21;
 
 import {console2, Test} from "forge-std/Test.sol";
-import {DeployMigratorScript} from "../script/DeployMigrator.sol";
-import {Migrator} from "../src/Migrator.sol";
+import {DeployMigratorScript} from "../../script/DeployMigrator.sol";
+import {Migrator} from "../../src/Migrator.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 contract MigratorTest is Test {
@@ -23,8 +23,8 @@ contract MigratorTest is Test {
 
     uint256 oneEther = 1 ether;
 
-    event migrated(address indexed account, uint256 amount);
-    event feededRingV2(address indexed account, uint256 amount);
+    event migration(address indexed account, Migrator.UserMigration userMigration);
+    event ringV2Deposit(address indexed account, uint256 amount);
     event withdrawal(uint256 amount);
 
     function setUp() public {
@@ -107,14 +107,26 @@ contract MigratorTest is Test {
         _;
     }
 
-    function test_CanFeedRingV2() public unpaused dealFundsToActor(john, ringV2, oneEther) {
+    function test_CanFeedRingV2()
+        public
+        unpaused
+        dealFundsToActor(john, ringV2, oneEther)
+        dealFundsToActor(bob, ringV2, migrator.MAX_RING_PER_MIGRATION() * 2)
+    {
         vm.startPrank(john);
         vm.expectEmit();
-        emit feededRingV2(john, oneEther);
+        emit ringV2Deposit(john, oneEther);
         migrator.feedRingV2(oneEther);
         vm.stopPrank();
 
         assertEq(ERC20(ringV2).balanceOf(address(migrator)), oneEther);
+
+        uint256 bigAmount = migrator.MAX_RING_PER_MIGRATION() * 2;
+        vm.startPrank(bob);
+        migrator.feedRingV2(bigAmount);
+        vm.stopPrank();
+
+        assertEq(ERC20(ringV2).balanceOf(address(migrator)), bigAmount + oneEther);
     }
 
     //////////////////////////////////////
@@ -167,20 +179,34 @@ contract MigratorTest is Test {
         migrator.migrate(0);
     }
 
-    function test_RevertsMigrationWhenBalanceIsLowerThanAmount() public unpaused {
+    modifier contractHasRingV2(uint256 amount) {
+        deal(ringV2, address(migrator), amount);
+        _;
+    }
+
+    function test_RevertsMigrationWhenBalanceIsLowerThanAmount()
+        public
+        unpaused
+        contractHasRingV2(migrator.MAX_RING_PER_MIGRATION())
+    {
         vm.expectRevert(Migrator.Migrator__Insufficient_Balance.selector);
         migrator.migrate(oneEther);
     }
 
     function test_RevertsWhenContractHasNoBalanceToMigrate() public unpaused dealFundsToActor(bob, ring, oneEther) {
         vm.startPrank(bob);
-        vm.expectRevert(Migrator.Migrator__Insufficient_Balance.selector);
+        vm.expectRevert(Migrator.Migrator__Insufficient_Ring_V2_Available.selector);
         migrator.migrate(oneEther);
         vm.stopPrank();
     }
 
-    function test_RevertsMigrationWhenExceedsLimit() public unpaused {
+    function test_RevertsMigrationWhenExceedsLimit()
+        public
+        unpaused
+        contractHasRingV2(migrator.MAX_RING_PER_MIGRATION() * 2)
+    {
         uint256 amount = migrator.MAX_RING_PER_MIGRATION() + oneEther;
+
         vm.expectRevert(Migrator.Migrator__Exceeds_Max_Migration_Limit.selector);
         migrator.migrate(amount);
     }
@@ -206,15 +232,20 @@ contract MigratorTest is Test {
         vm.stopPrank();
     }
 
-    function test_MigratesRingToRingV2() public unpaused dealFundsToActor(john, ring, oneEther) {
-        deal(ringV2, address(migrator), oneEther);
-
+    function test_MigratesRingToRingV2()
+        public
+        unpaused
+        contractHasRingV2(oneEther)
+        dealFundsToActor(john, ring, oneEther)
+    {
         uint256 balanceOfRingBefore = ERC20(ring).balanceOf(john);
         uint256 balanceOfRingV2Before = ERC20(ringV2).balanceOf(john);
 
+        Migrator.UserMigration memory userMigration = Migrator.UserMigration(oneEther, oneEther, block.timestamp);
+
         vm.startPrank(john);
         vm.expectEmit();
-        emit migrated(john, oneEther);
+        emit migration(john, userMigration);
         migrator.migrate(oneEther);
         vm.stopPrank();
 
@@ -233,12 +264,16 @@ contract MigratorTest is Test {
         unpaused
         dealFundsToActor(bob, ring, migrator.MAX_RING_PER_MIGRATION() * 2)
         migrateLimit(bob)
+        contractHasRingV2(oneEther)
     {
-        deal(ringV2, address(migrator), oneEther);
         vm.warp(block.timestamp + 1 days);
+
+        Migrator.UserMigration memory userMigration =
+            Migrator.UserMigration(migrator.MAX_RING_PER_MIGRATION() + oneEther, oneEther, block.timestamp);
+
         vm.startPrank(bob);
         vm.expectEmit();
-        emit migrated(bob, oneEther);
+        emit migration(bob, userMigration);
         migrator.migrate(oneEther);
         vm.stopPrank();
     }
@@ -260,23 +295,27 @@ contract MigratorTest is Test {
     function test_RevertsMigratingAllWhenUserBalanceIsHigherThanContractBalance()
         public
         unpaused
+        contractHasRingV2(oneEther / 2)
         dealFundsToActor(john, ring, oneEther)
     {
-        deal(ringV2, address(migrator), oneEther / 2);
         vm.startPrank(john);
         vm.expectRevert(Migrator.Migrator__Insufficient_Balance.selector);
         migrator.migrateAll();
         vm.stopPrank();
     }
 
-    function test_MigratesAllRingFundsToRingV2() public unpaused dealFundsToActor(john, ring, oneEther) {
-        deal(ringV2, address(migrator), oneEther);
-
+    function test_MigratesAllRingFundsToRingV2()
+        public
+        unpaused
+        contractHasRingV2(oneEther)
+        dealFundsToActor(john, ring, oneEther)
+    {
         uint256 balanceOfRingBefore = ERC20(ring).balanceOf(john);
         uint256 balanceOfRingV2Before = ERC20(ringV2).balanceOf(john);
+        Migrator.UserMigration memory userMigration = Migrator.UserMigration(oneEther, oneEther, block.timestamp);
 
         vm.startPrank(john);
-        emit migrated(john, oneEther);
+        emit migration(john, userMigration);
         migrator.migrateAll();
         vm.stopPrank();
 
